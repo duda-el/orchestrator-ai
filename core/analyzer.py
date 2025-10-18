@@ -31,6 +31,7 @@ def analyze_repository(repo_path: str) -> Dict[str, Any]:
 
 def _find_services(directory: str) -> List[Dict[str, Any]]:
     """
+    Finds services by looking for package.json files.
     """
     services = []
     for root, _, files in os.walk(directory):
@@ -41,22 +42,21 @@ def _find_services(directory: str) -> List[Dict[str, Any]]:
                     package_data = json.load(f)
                 
                 dependencies = package_data.get("dependencies", {})
-                service_info = None
+                dev_dependencies = package_data.get("devDependencies", {})
+                all_dependencies = {**dependencies, **dev_dependencies}
 
-                if "react" in dependencies:
-                    service_info = {
-                        "name": package_data.get("name", os.path.basename(root)),
-                        "path": os.path.relpath(root, directory).replace('\\', '/'),
-                        "type": "frontend",
-                        "port": 5173
-                    }
-                elif "express" in dependencies:
-                    service_info = {
-                        "name": package_data.get("name", os.path.basename(root)),
-                        "path": os.path.relpath(root, directory).replace('\\', '/'),
-                        "type": "backend",
-                        "port": 3000
-                    }
+                service_type = "Node"  # Default to Node
+                if "react" in all_dependencies:
+                    service_type = "React"
+
+                start_command = package_data.get("scripts", {}).get("start")
+
+                service_info = {
+                    "name": package_data.get("name", os.path.basename(root)),
+                    "path": os.path.relpath(root, directory).replace('\\', '/'),
+                    "type": service_type,
+                    "start_command": start_command
+                }
                 
                 if service_info:
                     services.append(service_info)

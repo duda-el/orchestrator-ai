@@ -4,6 +4,14 @@ import shutil
 import subprocess
 import os
 from pathlib import Path
+import sys
+import json
+
+# Add the parent directory to the Python path to allow imports from 'core'
+sys.path.append(str(Path(__file__).resolve().parents[1]))
+
+from core.analyzer import analyze_repository
+
 
 def clone_repo(repo_url: str) -> str:
     """
@@ -28,13 +36,17 @@ def cmd_analyze(repo_url: str):
     repo_path = clone_repo(repo_url)
     print(f"📦 cloned into: {repo_path}")
 
-    # 2) list a few top-level files/folders so we can see it worked
-    top = os.listdir(repo_path)
-    print("📁 top-level entries:", top[:10])
+    # 2) Analyze the repository
+    print("🔍 analyzing repository...")
+    analysis_result = analyze_repository(repo_path)
+    print("\n--- Analysis Result ---")
+    print(json.dumps(analysis_result, indent=4))
+    print("-----------------------\n")
+
 
     # NOTE: we'll keep the temp folder for step 3 (analysis).
     # If you want to clean it up right now, uncomment:
-    # shutil.rmtree(repo_path, ignore_errors=True)
+    shutil.rmtree(repo_path, ignore_errors=True)
 
 
 def main():
