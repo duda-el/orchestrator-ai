@@ -60,8 +60,8 @@ def cli():
 
 @cli.command()
 @click.argument('repo_url')
-def analyze(repo_url):
-    """Analyzes a Git repository and prints the structure as JSON."""
+def inspect(repo_url):
+    """Analyzes a Git repository and prints only the structure as JSON (no Docker generation)."""
     tmpdir = None
     try:
         click.echo(f"Cloning repository from {repo_url}...")
@@ -71,6 +71,72 @@ def analyze(repo_url):
         click.echo(json.dumps(repo_structure, indent=4))
     except (ValueError, click.ClickException) as e:
         click.echo(f"Error: {e}", err=True)
+    finally:
+        if tmpdir:
+            safe_rmtree(tmpdir)
+
+@cli.command()
+@click.argument('repo_url')
+@click.option('--output-dir', default='output', help='Directory to save generated files.')
+def analyze(repo_url, output_dir):
+    """Analyzes a Git repository, prints the structure as JSON, and automatically generates Docker files."""
+    tmpdir = None
+    try:
+        # Ensure output directory exists
+        os.makedirs(output_dir, exist_ok=True)
+
+        click.echo(f"Cloning repository from {repo_url}...")
+        tmpdir = clone_repo(repo_url)
+        
+        # Analyze repository structure
+        repo_structure = analyze_repository(tmpdir)
+        click.echo("\n--- Repository Structure ---")
+        click.echo(json.dumps(repo_structure, indent=4))
+        click.echo("---------------------------\n")
+        
+        # Check if there are services to generate Docker files for
+        if not repo_structure.get("services"):
+            click.echo("No services found in the repository. Skipping Docker file generation.")
+            return
+        
+        # Initialize LLM client and generate Docker configuration
+        click.echo("Initializing Gemini client...")
+        llm_client = GeminiClient()
+
+        click.echo("Generating Docker configuration via LLM...")
+        docker_config = generate_docker_configuration(repo_structure, llm_client)
+
+        # Save Dockerfiles
+        for dockerfile_info in docker_config.get("dockerfiles", []):
+            path = dockerfile_info.get("path")
+            content = dockerfile_info.get("content")
+            if not path or not content:
+                click.echo(f"Warning: Skipping invalid Dockerfile entry.", err=True)
+                continue
+            
+            # Create service-specific directory inside output_dir
+            service_dir = os.path.join(output_dir, os.path.dirname(path))
+            os.makedirs(service_dir, exist_ok=True)
+            
+            dockerfile_path = os.path.join(output_dir, path)
+            with open(dockerfile_path, "w", encoding="utf-8") as f:
+                f.write(content)
+            click.echo(f"Generated Dockerfile: {dockerfile_path}")
+
+        # Save docker-compose.yml
+        docker_compose_content = docker_config.get("docker_compose")
+        if docker_compose_content:
+            compose_path = os.path.join(output_dir, "docker-compose.yml")
+            with open(compose_path, "w", encoding="utf-8") as f:
+                f.write(docker_compose_content)
+            click.echo(f"Generated docker-compose.yml: {compose_path}")
+        
+        click.echo("\nAnalysis and Docker generation complete!")
+        
+    except (ValueError, click.ClickException) as e:
+        click.echo(f"Error: {e}", err=True)
+    except Exception as e:
+        click.echo(f"An unexpected error occurred: {e}", err=True)
     finally:
         if tmpdir:
             safe_rmtree(tmpdir)

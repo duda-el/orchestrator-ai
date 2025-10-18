@@ -4,25 +4,30 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm ci
 COPY . .
-# Assuming a build step for Node.js projects (e.g., TypeScript compilation)
+# Assuming a build step for transpilation (e.g., TypeScript to JavaScript).
+# If not needed, you can comment this line out.
 RUN npm run build
 
 # Production stage
 FROM node:18-alpine
-RUN addgroup -g 1001 -S nodejs && adduser -S nodejs -u 1001
+# Create a non-root user for enhanced security
+RUN addgroup -g 1001 -S nodejs && adduser -S nodejs -u 1001 nodejs
 WORKDIR /app
 COPY package*.json ./
+# Install only production dependencies
 RUN npm ci --only=production
-# Copy build artifacts from the builder stage
+# Copy built artifacts from the builder stage. Assumes 'npm run build' creates a 'dist' directory.
 COPY --from=builder /app/dist ./dist
-COPY --from=builder /app/src ./src
-# Copy any other necessary files (e.g., static assets, templates)
-COPY . . 
-# Ensure only production dependencies are installed and accessible by the non-root user
+# If no build step was used, copy all source files directly (comment out previous line and uncomment this one):
+# COPY --from=builder /app .
+
+# Set proper ownership for the application directory
 RUN chown -R nodejs:nodejs /app
+# Switch to the non-root user
 USER nodejs
-EXPOSE 3000
-# Health check for Node.js application, assumes a /health endpoint
+EXPOSE 4000
+# Health check: Assumes your Node.js app exposes a /health endpoint
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
-  CMD wget --quiet --tries=1 --spider http://localhost:3000/health || exit 1
+  CMD wget --quiet --tries=1 --spider http://localhost:4000/health || exit 1
+# Default start command for the application. Adjust if your entry file is different.
 CMD ["node", "dist/index.js"]
