@@ -129,7 +129,7 @@ def demo_prompt_generation():
 
 def main():
     """Run all demonstrations."""
-    print("🐳 Enhanced Docker Command Generation Demo")
+    print("Enhanced Docker Command Generation Demo")
     print("=" * 60)
     
     try:
@@ -139,7 +139,7 @@ def main():
         demo_command_examples()
         demo_prompt_generation()
         
-        print("✅ All demonstrations completed successfully!")
+        print("All demonstrations completed successfully!")
         print("\nKey Features Demonstrated:")
         print("- OS detection from shell information")
         print("- OS-specific command formatting (line continuations)")
@@ -148,7 +148,7 @@ def main():
         print("- Dynamic prompt generation")
         
     except Exception as e:
-        print(f"❌ Error during demonstration: {e}")
+        print(f" Error during demonstration: {e}")
         return 1
     
     return 0

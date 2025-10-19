@@ -1,7 +1,22 @@
 [project]
 name = "orchai"
 version = "0.1.0"
+description = "AI-powered CLI that analyzes repos, generates Docker configs, and can build & run them."
+readme = { file = "README.md", content-type = "text/markdown" }
+license = { text = "MIT" }
+authors = [{ name = "Ochopintre", email = "dudaelbakidze94@gmail.com" }]
 requires-python = ">=3.10"
+keywords = ["docker", "cli", "devops", "orchestrator", "automation"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Topic :: Software Development :: Build Tools",
+]
+
 dependencies = [
   "click>=8.1",
   "rich>=13.7",
@@ -10,6 +25,10 @@ dependencies = [
 
 [project.scripts]
 orchai = "cli.orchai:cli"
+
+[project.urls]
+Homepage = "https://github.com/duda-el/orchestrator-ai"
+Repository = "https://github.com/duda-el/orchestrator-ai/tree/main"
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]
