@@ -2,5 +2,10 @@
 <project version="4">
   <component name="VcsDirectoryMappings">
     <mapping directory="" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/clones/MERN-AUTH-ADMIN" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/clones/Real-Time-Chat" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/clones/Real-Time-Chat-20251019-071446" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/clones/Real-Time-Chat-20251019-072430" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/clones/Real-Time-Chat-20251019-073841" vcs="Git" />
   </component>
 </project>

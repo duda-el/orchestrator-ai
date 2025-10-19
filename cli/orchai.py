@@ -15,7 +15,8 @@ import stat
 import time
 from contextlib import redirect_stderr
 from collections import Counter
-
+from datetime import datetime
+from urllib.parse import urlparse
 
 from rich.console import Console
 from rich.theme import Theme
@@ -93,23 +94,99 @@ def safe_rmtree(path):
         shutil.rmtree(path, onerror=handle_remove_readonly)
 
 
-def clone_repo(repo_url: str) -> str:
-    tmpdir = tempfile.mkdtemp(prefix="orchai_")
+# ----------------- helpers for persistent clone by default -----------------
+def _repo_name_from_url(repo_url: str) -> str:
+    """
+    Extract repo name from URL. Examples:
+      https://github.com/octocat/Hello-World.git -> Hello-World
+      git@github.com:octo/hello.git -> hello
+    """
+    parsed = urlparse(repo_url)
+    tail = parsed.path or repo_url.split(":")[-1]
+    name = tail.rstrip("/").split("/")[-1]
+    if name.endswith(".git"):
+        name = name[:-4]
+    return name or "repo"
+
+
+def _default_persistent_clone_dir(repo_url: str) -> Path:
+    """
+    Default persistent directory under <project_root>/clones/<repo-name>.
+    If exists and non-empty, append timestamp to avoid collisions.
+    """
+    clones_base = project_root / "clones"
+    clones_base.mkdir(parents=True, exist_ok=True)
+    base = clones_base / _repo_name_from_url(repo_url)
+    if base.exists() and any(base.iterdir()):
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        base = clones_base / f"{base.name}-{stamp}"
+    return base
+
+
+def _docker_available() -> bool:
+    try:
+        subprocess.run(["docker", "--version"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except Exception:
+        return False
+
+
+def _docker_daemon_running() -> bool:
+    try:
+        subprocess.run(["docker", "info"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except Exception:
+        return False
+
+
+def _compose(args: list[str], project_dir: Path) -> None:
+    """
+    Run docker compose with args in the given project_dir.
+    Prefers 'docker compose' (v2). Falls back to 'docker-compose' if needed.
+    """
+    cmds = [["docker", "compose"], ["docker-compose"]]
+    for cmd in cmds:
+        try:
+            subprocess.run(cmd + args, cwd=str(project_dir), check=True)
+            return
+        except FileNotFoundError:
+            continue
+    raise click.ClickException("Neither 'docker compose' nor 'docker-compose' is available on PATH.")
+
+
+# ---- clone_repo: persistent by default; temp only when dest_dir=None is explicitly passed ----
+def clone_repo(repo_url: str, dest_dir: str | Path | None = "DEFAULT_PERSIST") -> str:
+    """
+    - If dest_dir == 'DEFAULT_PERSIST' (default), clone into a persistent folder under project_root/clones/<repo-name>.
+    - If dest_dir is a path, clone there.
+    - If dest_dir is None, clone into a temporary folder (deleted later by caller).
+    """
+    if dest_dir == "DEFAULT_PERSIST":
+        dest_dir = _default_persistent_clone_dir(repo_url)
+
+    if dest_dir is None:
+        target_dir = tempfile.mkdtemp(prefix="orchai_")
+    else:
+        dest_dir = Path(dest_dir)
+        dest_dir.parent.mkdir(parents=True, exist_ok=True)
+        target_dir = str(dest_dir)
+
     try:
         subprocess.run(
-            ["git", "clone", "--depth", "1", repo_url, tmpdir],
+            ["git", "clone", "--depth", "1", repo_url, target_dir],
             check=True,
-            stdout=subprocess.DEVNULL,  # silence git
+            stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        return tmpdir
+        return target_dir
     except subprocess.CalledProcessError as e:
-        safe_rmtree(tmpdir)
+        if dest_dir is None and os.path.exists(target_dir):
+            safe_rmtree(target_dir)
         raise click.ClickException(f"Failed to clone repository: {e}")
     except FileNotFoundError:
-        safe_rmtree(tmpdir)
+        if dest_dir is None and os.path.exists(target_dir):
+            safe_rmtree(target_dir)
         raise click.ClickException("Git is not installed or not in your PATH.")
-
 
 
 def table_generated_files(docker_config, output_dir: str) -> Table:
@@ -170,6 +247,8 @@ EXT_LANG = {
     ".yml": "YAML", ".yaml": "YAML", ".json": "JSON", ".toml": "TOML", ".ini": "INI",
     ".md": "Markdown", ".html": "HTML", ".css": "CSS", ".scss": "SCSS",
 }
+
+
 def fallback_scan(root: Path) -> tuple[list[str], dict]:
     files = []
     langs = Counter()
@@ -197,7 +276,8 @@ def inspect(repo_url, as_json):
     try:
         banner("Orchestrator-AI", "Repository Inspector")
         with console.status("[bold cyan]Cloning repository...", spinner="earth"):
-            tmpdir = clone_repo(repo_url)
+            # For inspect we keep the original temp behavior; delete after.
+            tmpdir = clone_repo(repo_url, dest_dir=None)
 
         with console.status("[bold cyan]Analyzing project structure...", spinner="dots"):
             repo_structure = analyze_repository(tmpdir)
@@ -223,32 +303,38 @@ def inspect(repo_url, as_json):
 
 @cli.command()
 @click.argument("repo_url")
-@click.option("--output-dir", default="output", help="Directory to save generated files.")
+@click.option("--output-dir", default="output",
+              help="Directory to save generated files (ignored; kept for backward-compat).")
 @click.option("--json", "as_json", is_flag=True, help="Also print raw JSON of repo structure.")
-def analyze(repo_url, output_dir, as_json):
+@click.option("--inplace", is_flag=True,
+              help="(Kept for compatibility) Writes into the cloned repo root (default now).")
+@click.option("--clone-dir", default=None, help="Clone into this directory; overrides default persistent folder.")
+@click.option("--no-build", is_flag=True, help="Skip Docker build step (build runs by default).")
+def analyze(repo_url, output_dir, as_json, inplace, clone_dir, no_build):
     """
-    Analyze a Git repository, show a scan summary, and generate Docker files.
+    Clone (persistent), analyze, generate Docker files inside the cloned repo, and build by default.
     """
     tmpdir = None
     try:
-        os.makedirs(output_dir, exist_ok=True)
         banner("Orchestrator-AI", "Analyze & Generate")
 
         # ---- Phase bars (clone + analyze) ----
         with Progress(
-            SpinnerColumn(spinner_name="line"),
-            TextColumn("[bold blue]{task.description}"),
-            BarColumn(complete_style="green", finished_style="bold green"),
-            TaskProgressColumn(),
-            MofNCompleteColumn(),
-            TimeElapsedColumn(),
-            console=console,
-            transient=True,
+                SpinnerColumn(spinner_name="line"),
+                TextColumn("[bold blue]{task.description}"),
+                BarColumn(complete_style="green", finished_style="bold green"),
+                TaskProgressColumn(),
+                MofNCompleteColumn(),
+                TimeElapsedColumn(),
+                console=console,
+                transient=True,
         ) as progress:
             t_clone = progress.add_task("Cloning repository...", total=1)
-            t_an    = progress.add_task("Analyzing repository...", total=1)
+            t_an = progress.add_task("Analyzing repository...", total=1)
 
-            tmpdir = clone_repo(repo_url)
+            # Persistent by default; --clone-dir overrides; no temp unless dest_dir=None is passed.
+            dest = Path(clone_dir) if clone_dir else _default_persistent_clone_dir(repo_url)
+            tmpdir = clone_repo(repo_url, dest_dir=dest)
             progress.update(t_clone, advance=1)
 
             repo_structure = analyze_repository(tmpdir)
@@ -271,34 +357,36 @@ def analyze(repo_url, output_dir, as_json):
 
         if not repo_structure.get("services"):
             msg_warn("No services found. Skipping Docker generation.")
+            msg_info(f"Repo cloned to: [highlight]{Path(tmpdir).resolve()}[/highlight]")
             return
 
-        # ---- ONE LLM generation (silence stderr noise while spinner runs) ----
+        # ---- ONE LLM generation ----
         msg_info("Initializing LLM client")
         llm_client = GeminiClient()
         with console.status("[bold cyan]Generating Docker configuration...", spinner="dots"):
             with open(os.devnull, "w") as _null, redirect_stderr(_null):
                 docker_config = generate_docker_configuration(repo_structure, llm_client)
 
-        # ---- Writing files (separate progress block) ----
+        # ---- Write files directly into the cloned repo (correct structure) ----
         dockerfiles = docker_config.get("dockerfiles", []) or []
         nginx_configs = docker_config.get("nginx_configs", []) or []
         total_writes = len(dockerfiles) + len(nginx_configs) + (1 if docker_config.get("docker_compose") else 0)
 
+        write_base = Path(tmpdir)
         with console.status("[bold cyan]Writing files...", spinner="bouncingBar"):
             with Progress(
-                SpinnerColumn(spinner_name="dots"),
-                TextColumn("[bold blue]{task.description}"),
-                BarColumn(complete_style="green", finished_style="bold green"),
-                TaskProgressColumn(),
-                MofNCompleteColumn(),
-                TimeElapsedColumn(),
-                console=console,
-                transient=True,
+                    SpinnerColumn(spinner_name="dots"),
+                    TextColumn("[bold blue]{task.description}"),
+                    BarColumn(complete_style="green", finished_style="bold green"),
+                    TaskProgressColumn(),
+                    MofNCompleteColumn(),
+                    TimeElapsedColumn(),
+                    console=console,
+                    transient=True,
             ) as write_progress:
                 t_write = write_progress.add_task("Writing files...", total=total_writes)
 
-                # Write Dockerfiles
+                # Dockerfiles
                 for info in dockerfiles:
                     path = info.get("path")
                     content = info.get("content")
@@ -306,13 +394,12 @@ def analyze(repo_url, output_dir, as_json):
                         msg_warn("Skipping invalid Dockerfile entry.")
                         write_progress.update(t_write, advance=1)
                         continue
-
-                    out_path = Path(output_dir) / path
+                    out_path = write_base / path
                     out_path.parent.mkdir(parents=True, exist_ok=True)
                     out_path.write_text(content, encoding="utf-8")
                     write_progress.update(t_write, advance=1)
 
-                # Write Nginx configs
+                # Nginx configs
                 for info in nginx_configs:
                     path = info.get("path")
                     content = info.get("content")
@@ -320,79 +407,108 @@ def analyze(repo_url, output_dir, as_json):
                         msg_warn("Skipping invalid Nginx config entry.")
                         write_progress.update(t_write, advance=1)
                         continue
-
-                    out_path = Path(output_dir) / path
+                    out_path = write_base / path
                     out_path.parent.mkdir(parents=True, exist_ok=True)
                     out_path.write_text(content, encoding="utf-8")
                     write_progress.update(t_write, advance=1)
 
-                # Write docker-compose
+                # docker-compose.yml at repo root
                 if docker_config.get("docker_compose"):
-                    (Path(output_dir) / "docker-compose.yml").write_text(
+                    (write_base / "docker-compose.yml").write_text(
                         docker_config["docker_compose"], encoding="utf-8"
                     )
                     write_progress.update(t_write, advance=1)
 
-        console.print(table_generated_files(docker_config, output_dir))
+        console.print(table_generated_files(docker_config, str(write_base)))
+        repo_path = Path(tmpdir).resolve()
+        msg_info(f"Repo cloned to: [highlight]{repo_path}[/highlight]")
+
+        # ---- Build after generation (default) ----
+        if not no_build:
+            compose_path = repo_path / "docker-compose.yml"
+            if not compose_path.exists():
+                msg_warn("No docker-compose.yml found at repo root; skipping build.")
+            else:
+                if not _docker_available():
+                    raise click.ClickException("Docker is not installed or not on PATH.")
+                if not _docker_daemon_running():
+                    raise click.ClickException(
+                        "Docker daemon is not running. Please start Docker Desktop and try again."
+                    )
+
+                with console.status("[bold cyan]Validating docker-compose.yml...", spinner="dots"):
+                    _compose(["config"], repo_path)
+
+                with console.status("[bold cyan]Building images (docker compose build)...", spinner="earth"):
+                    _compose(["build"], repo_path)
+
+                msg_success("Docker images built successfully.")
+
+                # --- START CONTAINERS AUTOMATICALLY ---
+                with console.status("[bold green]Starting services (docker compose up -d)...", spinner="dots"):
+                    _compose(["up", "-d"], repo_path)
+                msg_success("Services started in the background (detached).")
+
         msg_success("Analysis and generation complete.")
 
     except (ValueError, click.ClickException) as e:
         msg_error(str(e))
     except Exception as e:
         msg_error(f"An unexpected error occurred: {e}")
-    finally:
-        if tmpdir:
-            with console.status("[bold cyan]Cleaning up...", spinner="bouncingBar"):
-                safe_rmtree(tmpdir)
-
 
 
 
 @cli.command()
 @click.argument("repo_url")
-@click.option("--output-dir", default="output", help="Directory to save generated files.")
-def generate(repo_url, output_dir):
+@click.option("--output-dir", default="output",
+              help="Directory to save generated files (ignored; kept for backward-compat).")
+@click.option("--inplace", is_flag=True,
+              help="(Kept for compatibility) Writes into the cloned repo root (default now).")
+@click.option("--clone-dir", default=None, help="Clone into this directory; overrides default persistent folder.")
+def generate(repo_url, output_dir, inplace, clone_dir):
     """Generate Dockerfiles, nginx configs and docker-compose.yml from a Git repository."""
     tmpdir = None
     try:
-        os.makedirs(output_dir, exist_ok=True)
         banner("Orchestrator-AI", "Docker Generator")
 
+        # Persistent by default
+        dest = Path(clone_dir) if clone_dir else _default_persistent_clone_dir(repo_url)
         with console.status("[bold cyan]Cloning repository...", spinner="earth"):
-            tmpdir = clone_repo(repo_url)
+            tmpdir = clone_repo(repo_url, dest_dir=dest)
 
         with console.status("[bold cyan]Analyzing repository...", spinner="dots"):
             repo_structure = analyze_repository(tmpdir)
 
         if not repo_structure.get("services"):
             msg_warn("No services found. Nothing to generate.")
+            msg_info(f"Repo cloned to: [highlight]{Path(tmpdir).resolve()}[/highlight]")
             return
 
         with console.status("[bold cyan]Initializing LLM client...", spinner="aesthetic"):
             llm_client = GeminiClient()
 
-        # LOADER: LLM generation step
         with console.status("[bold cyan]Generating Docker configuration...", spinner="hamburger"):
             docker_config = generate_docker_configuration(repo_structure, llm_client)
 
-        # LOADER: Writing files (spinner + progress)
+        # Write into repo root
         dockerfiles = docker_config.get("dockerfiles", []) or []
         nginx_configs = docker_config.get("nginx_configs", []) or []
         total_tasks = len(dockerfiles) + len(nginx_configs) + (1 if docker_config.get("docker_compose") else 0)
 
+        write_base = Path(tmpdir)
         with console.status("[bold cyan]Writing files...", spinner="bouncingBar"):
             with Progress(
-                SpinnerColumn(spinner_name="dots"),
-                TextColumn("[bold blue]{task.description}"),
-                BarColumn(complete_style="green", finished_style="bold green"),
-                TaskProgressColumn(),
-                MofNCompleteColumn(),
-                TimeElapsedColumn(),
-                console=console,
+                    SpinnerColumn(spinner_name="dots"),
+                    TextColumn("[bold blue]{task.description}"),
+                    BarColumn(complete_style="green", finished_style="bold green"),
+                    TaskProgressColumn(),
+                    MofNCompleteColumn(),
+                    TimeElapsedColumn(),
+                    console=console,
             ) as progress:
                 task = progress.add_task("[green]Writing files...", total=total_tasks)
 
-                # Write Dockerfiles
+                # Dockerfiles
                 for info in dockerfiles:
                     path = info.get("path")
                     content = info.get("content")
@@ -400,15 +516,13 @@ def generate(repo_url, output_dir):
                         msg_warn("Skipping invalid Dockerfile entry.")
                         progress.update(task, advance=1)
                         continue
-
-                    service_dir = Path(output_dir) / Path(path).parent
+                    service_dir = write_base / Path(path).parent
                     service_dir.mkdir(parents=True, exist_ok=True)
-
-                    dockerfile_path = Path(output_dir) / path
+                    dockerfile_path = write_base / path
                     dockerfile_path.write_text(content, encoding="utf-8")
                     progress.update(task, advance=1)
 
-                # Write Nginx configs
+                # Nginx configs
                 for info in nginx_configs:
                     path = info.get("path")
                     content = info.get("content")
@@ -416,32 +530,28 @@ def generate(repo_url, output_dir):
                         msg_warn("Skipping invalid Nginx config entry.")
                         progress.update(task, advance=1)
                         continue
-
-                    service_dir = Path(output_dir) / Path(path).parent
+                    service_dir = write_base / Path(path).parent
                     service_dir.mkdir(parents=True, exist_ok=True)
-
-                    nginx_path = Path(output_dir) / path
+                    nginx_path = write_base / path
                     nginx_path.write_text(content, encoding="utf-8")
                     progress.update(task, advance=1)
 
-                # Write docker-compose
+                # docker-compose.yml
                 docker_compose_content = docker_config.get("docker_compose")
                 if docker_compose_content:
-                    compose_path = Path(output_dir) / "docker-compose.yml"
+                    compose_path = write_base / "docker-compose.yml"
                     compose_path.write_text(docker_compose_content, encoding="utf-8")
                     progress.update(task, advance=1)
 
-        console.print(table_generated_files(docker_config, output_dir))
+        console.print(table_generated_files(docker_config, str(write_base)))
+        repo_path = Path(tmpdir).resolve()
+        msg_info(f"Repo cloned to: [highlight]{repo_path}[/highlight]")
         msg_success("Generation complete.")
 
     except (ValueError, click.ClickException) as e:
         msg_error(str(e))
     except Exception as e:
         msg_error(f"An unexpected error occurred: {e}")
-    finally:
-        if tmpdir:
-            with console.status("[bold cyan]Cleaning up...", spinner="bouncingBar"):
-                safe_rmtree(tmpdir)
 
 
 @cli.command()
@@ -457,7 +567,7 @@ def commands(repo_url, target_os, shell_type, output_dir):
         banner("Orchestrator-AI", "OS-Specific Docker Commands")
 
         with console.status("[bold cyan]Cloning repository...", spinner="earth"):
-            tmpdir = clone_repo(repo_url)
+            tmpdir = clone_repo(repo_url, dest_dir=None)
 
         with console.status("[bold cyan]Analyzing repository...", spinner="dots"):
             repo_structure = analyze_repository(tmpdir)
@@ -498,13 +608,13 @@ def commands(repo_url, target_os, shell_type, output_dir):
         results_table.add_row("Detected OS", detected_os)
         results_table.add_row("Shell Type", shell_type or "Default")
         results_table.add_row("Services Found", str(len(repo_structure.get("services", []))))
-        
+
         console.print(results_table)
 
         # Show generated content
-        console.print("\n" + "="*60)
+        console.print("\n" + "=" * 60)
         console.print("[bold cyan]Generated Docker Commands:[/bold cyan]")
-        console.print("="*60)
+        console.print("=" * 60)
         console.print(command_result["response"])
 
         # Save the response to a file
@@ -528,7 +638,7 @@ def commands(repo_url, target_os, shell_type, output_dir):
 Here are some example commands formatted for {detected_os}:
 
 """
-        
+
         # Add OS-specific examples
         examples = create_docker_command_examples(detected_os)
         for example_name, example_cmd in examples.items():
@@ -568,13 +678,13 @@ Here are some example commands formatted for {detected_os}:
 def examples(target_os):
     """Show Docker command examples for different operating systems."""
     banner("Orchestrator-AI", f"Docker Command Examples for {target_os}")
-    
+
     examples_dict = create_docker_command_examples(target_os)
-    
+
     for example_name, example_cmd in examples_dict.items():
         console.print(f"\n[bold cyan]{example_name.replace('_', ' ').title()}:[/bold cyan]")
         console.print(Panel(example_cmd, border_style="blue", box=ROUNDED))
-    
+
     msg_success(f"Examples shown for {target_os}")
 
 
